@@ -1,0 +1,9 @@
+# Build output
+/build/
+/stremio-switch.nro
+/.updatetest/
+/stremio-switch.elf
+/stremio-switch.nacp
+/dist/
+/pctest/enginetest
+*.o

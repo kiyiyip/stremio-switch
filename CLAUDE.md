@@ -1,0 +1,97 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+Stremio Switch — Nintendo Switch homebrew that brings a Stremio account to the
+console: library, addons and sources, with playback on the device. Torrent
+sources *stream*: an on-device BitTorrent engine feeds mpv through a custom
+devoptab, so playback starts on the first pieces instead of waiting for a
+download. Direct HTTP(S) sources (debrid addons) go through a second devoptab.
+The UI is borealis (Horizon style).
+
+## Build
+
+devkitPro is not installed locally: build through the Docker image, with the
+build tree kept in a named volume (`st_build`) so it survives between runs.
+
+```sh
+docker run --rm -v st_build:/build -v "$PWD":/project -w /build \
+    devkitpro/devkita64:latest \
+    sh -c "cmake --build . --target stremio-switch.nro"
+
+# copy the result out of the volume
+docker run --rm -v st_build:/build -v "$PWD":/project \
+    devkitpro/devkita64:latest sh -c "cp /build/stremio-switch.nro /project/"
+```
+
+Adding or removing a source file needs a configure pass (the sources are
+globbed): `cmake .` in the same container, before the build. A first build in a
+fresh volume needs `cmake /project` instead.
+
+Produces `stremio-switch.nro`, which runs from the Homebrew Menu on a CFW
+Switch. On Windows, prefix docker commands with `MSYS_NO_PATHCONV=1` or Git Bash
+rewrites the container paths.
+
+## Architecture
+
+- `app/` — the UI (C++, borealis): `main` (app shell, header/view bar, log sink),
+  `player` (mpv view + loading screen + seek), `stremio` (API, library,
+  artwork), `browse` (the Stremio drill-down), `settings`, `update`, `config`
+  (config.json), `http`
+- `engine/` — the torrent engine (C): `torrentfs` (piece picking, cache, the
+  streaming read), `peer`, `swarm`, `torrent`, `udp_tracker`, `dht`, `magnet`,
+  `stream` (the devoptab mpv reads through), `httpstream` (direct links), plus
+  vendored libutp (`utp*.cpp`)
+- `include/` — libutp headers, paired with `engine/utp*.cpp`
+- `assets/` — app icon, the Stremio mark, the CA bundle, the UI font
+- `library/borealis/` — vendored UI framework, locally patched: see its
+  `VENDORED.md` (upstream commit + the ENOBUFS patch, re-apply if re-cloned)
+- `pctest/` — builds the engine for a PC, without the Switch or the UI
+
+The entry point is `int main()` in `app/main.cpp`. The app data lives under
+`sdmc:/switch/stremio-switch/` (see `app/appdata.hpp`).
+
+## Constraints worth knowing before changing things
+
+- **nanovg is batched**: every `nvg*` call flushes at `nvgEndFrame`, *after*
+  `MpvView::draw()` runs — mpv renders immediately. Drawing anything opaque in
+  the player without splitting the frame (`nvgEndFrame` / `nvgBeginFrame` around
+  the mpv render) paints over the video. That was the "black video, working
+  audio" bug.
+- **libnx caps concurrent *blocking* socket calls at 16** (`num_bsd_sessions`).
+  The peer loop is a single `poll()`, so it needs ~5 — this is *not* what limits
+  peer count (see the ENOBUFS patch in `library/borealis/VENDORED.md`).
+- **FAT32 caps a file at 4 GB**: the piece cache is chunked for this reason.
+- The Switch mounts **no CA store**, so the app ships one: `assets/cacert.pem`
+  is copied into the romfs and `app/http.cpp` points `CURLOPT_CAINFO` at
+  `romfs:/cacert.pem` with verification on. curl here is 7.69/mbedTLS, so
+  `CURLOPT_CAINFO_BLOB` does not exist — the bundle has to be a real file. A
+  rejected chain on device is usually **the console clock**, not an attacker.
+  The tracker announces in `engine/torrent.c` stay unverified on purpose.
+- `ScrollingFrame::setContentView()` detaches the view and forces its width, so
+  **margins on a content view are ignored** — put the inset on the rows.
+- A **GONE box's children stay focusable** (`Box::getDefaultFocus()` recurses
+  without checking the box's own visibility), and `giveFocus()` on a
+  non-focusable view is a **no-op** — which strands `Application::currentFocus`
+  on whatever it was, including freed views. See `setSubtreeFocusable()` and the
+  focus parking in `StremioTab::onAuthenticated`.
+- The Switch outputs stereo: mpv is forced to `audio-channels=stereo` or 5.1
+  dialogue (centre channel) is lost.
+
+## Debugging on device
+
+The log is **off by default** (Options → Log file) because it is unbuffered and
+the engine dumps a `[stats]` line every 2s. Turn it on, restart, reproduce.
+
+ZR in the player opens a live panel of every engine counter. `fail: N sock/local`
+climbing with `last err: socket(): No buffer space available` means the socket
+buffer pool is exhausted — see `library/borealis/VENDORED.md`.
+
+For a crash, Atmosphère writes a report to `sdmc:/atmosphere/crash_reports/`.
+The ELF is linked at vaddr 0, so the offsets map directly:
+
+```sh
+aarch64-none-elf-addr2line -Cfe /build/stremio-switch.elf <offset>
+```
